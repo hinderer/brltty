@@ -106,6 +106,7 @@ PUBLIC_KEY_TABLE(clio)
 
 #define	INPUT_BUFFER_SIZE 1024
 #define MAXIMUM_DISPLAY_SIZE 80
+#define MAXPACKETSIZE 255
 
 typedef struct {
   char modelCode[3];
@@ -291,7 +292,6 @@ static const ModelEntry *model;
 static int forceWindowRewrite;
 static int forceVisualRewrite;
 static int forceCursorRewrite;
-static int inputPacketNumber;
 static int outputPacketNumber;
 
 static inline void
@@ -315,130 +315,116 @@ needsEscape (unsigned char byte) {
   return 0;
 }
 
+typedef enum {
+  PVS_PACKET_BEGIN,
+  PVS_FRAME_SIZE,
+  PVS_FRAME_CONTENT,
+} PacketVerifierState;
+
+static const char *packetVerifierStateName(PacketVerifierState state)
+{
+  switch (state) {
+    case PVS_PACKET_BEGIN: return "PVS_PACKET_BEGIN";
+    case PVS_FRAME_SIZE: return "PVS_FRAME_SIZE";
+    case PVS_FRAME_CONTENT: return "PVS_FRAME_CONTENT";
+  }
+
+  return "unknown packet verifier state";
+}
+
+typedef struct {
+  PacketVerifierState state;
+  int escaped;
+  unsigned int frameLength;
+  unsigned int frameIndex;
+  unsigned char checksum;
+  unsigned char packetNumber;
+} PacketVerifierData;
+
+static BraillePacketVerifierResult
+verifyPacket (
+  BrailleDisplay *brl,
+  const unsigned char *bytes, size_t size,
+  size_t *length, void *data
+) {
+  PacketVerifierData *pvd = data;
+  unsigned char byte = bytes[size-1];
+
+  logMessage(LOG_CATEGORY(BRAILLE_DRIVER),
+    "[eu] verifyPacket: state=%s, byte=0x%2x, size=%ld, length=%ld, frameLength=%d, frameIndex=%d",
+    packetVerifierStateName(pvd->state),
+    byte,
+    size,
+    *length,
+    pvd->frameLength,
+    pvd->frameIndex
+  );
+
+  if (pvd->state == PVS_PACKET_BEGIN) {
+    if (byte != SOH) return BRL_PVR_INVALID;
+    pvd->state = PVS_FRAME_SIZE;
+    return BRL_PVR_EXCLUDE;
+  }
+
+  if (pvd->escaped) {
+    pvd->escaped = 0;
+  } else if (byte == DLE) {
+    pvd->escaped = 1;
+    return BRL_PVR_EXCLUDE;
+  } else if ( (pvd->state == PVS_FRAME_CONTENT) &&
+              (pvd->frameIndex == 1) && (byte == EOT) ) {
+    int validPacket = ! pvd->checksum;
+
+    {
+      unsigned char response[] = { validPacket ? ACK : NAK };
+      writeBraillePacket(brl, NULL, response, sizeof(response));
+    }
+
+    pvd->packetNumber = bytes[size-3];
+    size -= 3; /* Remove packet number, packet checksum and end of packet */
+    *length = size;
+    return validPacket ? BRL_PVR_EXCLUDE : BRL_PVR_INVALID;
+  } else if ( (byte == SOH) || (byte == EOT) ) {
+    return BRL_PVR_INVALID;
+  }
+
+  switch (pvd->state) {
+    case PVS_FRAME_SIZE:
+      pvd->state = PVS_FRAME_CONTENT;
+      pvd->frameLength = byte;
+      pvd->frameIndex = 0;
+      *length += pvd->frameLength + 1;
+      break;
+
+    case PVS_FRAME_CONTENT:
+      pvd->frameIndex++;
+      if (pvd->frameIndex == pvd->frameLength) pvd->state = PVS_FRAME_SIZE;
+      break;
+
+    default:
+      logMessage(LOG_WARNING,
+        "[eu] verifyPacket: unsupported state %s",
+        packetVerifierStateName(pvd->state)
+      );
+      return BRL_PVR_INVALID;
+  }
+
+  pvd->checksum ^= byte;
+  return BRL_PVR_INCLUDE;
+}
+
 static ssize_t
 readPacket (BrailleDisplay *brl, void *packet, size_t size) {
-  unsigned char buffer[size + 4];
-  int offset = 0;
-  int escape = 0;
+  PacketVerifierData pvd = {
+    .state = PVS_PACKET_BEGIN,
+    .escaped = 0,
+    .frameLength = 0,
+    .frameIndex = 0,
+    .checksum = 0,
+    .packetNumber = 0,
+  };
 
-  while (1)
-    {
-      int started = offset > 0;
-      int escaped = 0;
-      unsigned char byte;
-
-      if (!io->readByte(brl, &byte, (started || escape)))
-        {
-          if (started) logPartialPacket(buffer, offset);
-          return (errno == EAGAIN)? 0: -1;
-        }
-
-      if (escape)
-        {
-          escape = 0;
-          escaped = 1;
-        }
-      else if (byte == DLE)
-        {
-          escape = 1;
-          continue;
-        }
-
-      if (!escaped)
-        {
-          switch (byte)
-            {
-            case SOH:
-              if (started)
-                {
-                  logShortPacket(buffer, offset);
-                  offset = 1;
-                  continue;
-                }
-              goto addByte;
-
-            case EOT:
-              break;
-
-            default:
-              if (needsEscape(byte))
-                {
-                  if (started) logShortPacket(buffer, offset);
-                  offset = 0;
-                  continue;
-                }
-              break;
-            }
-        }
-
-      if (!started)
-        {
-          logIgnoredByte(byte);
-          continue;
-        }
-
-    addByte:
-      if (offset < sizeof(buffer))
-        {
-          buffer[offset] = byte;
-        }
-      else
-        {
-          if (offset == sizeof(buffer)) logTruncatedPacket(buffer, offset);
-          logDiscardedByte(byte);
-        }
-      offset += 1;
-
-      if (!escaped && (byte == EOT))
-        {
-          if (offset > sizeof(buffer))
-            {
-              offset = 0;
-              continue;
-            }
-
-          logInputPacket(buffer, offset);
-          offset -= 1; /* remove EOT */
-
-          {
-            unsigned char parity = 0;
-
-            {
-              int i;
-
-              for (i=1; i<offset; i+=1)
-                {
-                  parity ^= buffer[i];
-                }
-            }
-
-            if (parity) {
-              static const unsigned char message[] = {NAK, EU_NAK_PAR};
-
-              io->writeData(brl, message, sizeof(message));
-              offset = 0;
-              continue;
-            }
-          }
-
-          offset -= 1; /* remove parity */
-
-          {
-            static const unsigned char message[] = {ACK};
-            io->writeData(brl, message, sizeof(message));
-          }
-
-          if (buffer[--offset] == inputPacketNumber)
-            {
-              offset = 0;
-              continue;
-            }
-          inputPacketNumber = buffer[offset];
-
-          memcpy(packet, &buffer[1], offset-1);
-          return offset;
-        }
-    }
+  return readBraillePacket(brl, NULL, packet, size, verifyPacket, &pvd);
 }
 
 static ssize_t
@@ -446,13 +432,13 @@ writePacket (BrailleDisplay *brl, const void *packet, size_t size) {
 #define PUT(byte) \
   if (needsEscape((byte))) *target++ = DLE; \
   *target++ = (byte); \
-  parity ^= (byte);
+  checksum ^= (byte);
 
   /* limit case, every char is escaped */
   unsigned char	buffer[(size + 4) * 2]; 
   unsigned char	*target = buffer;
   const unsigned char *source = packet;
-  unsigned char	parity = 0;
+  unsigned char	checksum = 0;
 
   *target++ = SOH;
   PUT(size);
@@ -465,7 +451,7 @@ writePacket (BrailleDisplay *brl, const void *packet, size_t size) {
   PUT(outputPacketNumber);
   if (++outputPacketNumber >= 256) outputPacketNumber = 128;
 
-  PUT(parity);
+  PUT(checksum);
   *target++ = EOT;
 
   {
@@ -677,7 +663,6 @@ initializeDevice (BrailleDisplay *brl) {
   model = NULL;
 
   forceRewrite();
-  inputPacketNumber = -1;
   outputPacketNumber = 127;
 
   do {
